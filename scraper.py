@@ -1,186 +1,204 @@
-import requests
-from bs4 import BeautifulSoup
-import urllib.parse
+import asyncio
+import json
+from playwright.async_api import async_playwright
+from datetime import datetime
 import re
-import time
-import random
+import os
+import urllib.parse
+import aiohttp
 
 class PelandoScraper:
     def __init__(self):
-        self.base_url = "https://www.pelando.com.br/recentes"
-        self.user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Safari/605.1.15",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0"
-        ]
-        self.affiliate_ids = {
-            "amazon": "SEU_ID_AMAZON",
-            "mercado livre": "SEU_ID_MERCADOLIVRE",
-            "mercadolivre": "SEU_ID_MERCADOLIVRE",
-            "aliexpress": "SEU_ID_ALIEXPRESS"
-        }
+        self.base_url = "https://www.pelando.com.br/"
+        self.affiliate_id_amazon = "SEU_ID_AFILIADO_AMAZON"
+        self.affiliate_id_aliexpress = "SEU_ID_AFILIADO_ALIEXPRESS"
+        self.affiliate_id_mercadolivre = "SEU_ID_AFILIADO_MERCADOLIVRE"
 
-    def get_random_headers(self):
-        return {
-            "User-Agent": random.choice(self.user_agents),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1"
-        }
-
-    def scrape_offers(self, max_offers=10):
+    async def scrape_offers(self, max_offers=10):
         """Extrai ofertas do site Pelando"""
-        try:
-            print("Acessando o site Pelando...")
-            headers = self.get_random_headers()
-            response = requests.get(self.base_url, headers=headers)
-            response.raise_for_status()
+        async with async_playwright() as p:
+            user_data_dir = "./playwright_user_data"
+            is_first_run = not os.path.exists(user_data_dir) or not os.listdir(user_data_dir)
+            headless_mode = not is_first_run
             
-            soup = BeautifulSoup(response.text, 'html.parser')
-            deal_cards = soup.select('article._deal-card_1jdb6_25')
-            
-            offers = []
-            for card in deal_cards[:max_offers]:
-                try:
-                    title_element = card.select_one('span._title_mszsg_31')
-                    title = title_element.get_text(strip=True) if title_element else ""
-                    
-                    # Ignorar cupons
-                    if "cupom" in title.lower():
-                        print(f"\n⚠️ Oferta de cupom ignorada: '{title}'")
-                        continue
-                    
-                    store_element = card.select_one('span._container_13qz9_31 a')
-                    store = store_element.get_text(strip=True) if store_element else ""
-                    
-                    link_element = card.select_one('a._title_mszsg_31')
-                    original_link = link_element['href'] if link_element and 'href' in link_element.attrs else ""
-                    if original_link and not original_link.startswith("http"):
-                        original_link = f"https://www.pelando.com.br{original_link}"
-                    
-                    # Gerar link de afiliado
-                    affiliate_link = self.generate_affiliate_link(title, store)
-                    
-                    # Extrair preço
-                    price_element = card.select_one('span._deal-card-stamp_15l5n_25')
-                    price = price_element.get_text(strip=True) if price_element else ""
-                    
-                    # Extrair temperatura
-                    temp_element = card.select_one('span._deal-card-temperature_1o9of_29 span')
-                    temperature = temp_element.get_text(strip=True) if temp_element else ""
-                    
-                    # Extrair timestamp
-                    time_element = card.select_one('span._timestamp_1s0as_25')
-                    timestamp = time_element.get_text(strip=True) if time_element else ""
-                    
-                    # Extrair imagem
-                    img_element = card.select_one('img._deal-card-image_1glvo_31')
-                    image_url = img_element['src'] if img_element and 'src' in img_element.attrs else ""
-                    
-                    offers.append({
-                        'title': title,
-                        'price': price,
-                        'store': store,
-                        'temperature': temperature,
-                        'timestamp': timestamp,
-                        'link': affiliate_link,
-                        'original_link': original_link,
-                        'image_url': image_url
-                    })
-                    
-                    # Pausa aleatória para evitar bloqueio
-                    time.sleep(random.uniform(1.0, 3.0))
-                    
-                except Exception as e:
-                    print(f"Erro ao processar oferta: {e}")
-                    continue
+            if is_first_run:
+                print("PRIMEIRA EXECUÇÃO: Faça login no Mercado Livre e feche o navegador")
                 
-            print(f"Encontradas {len(offers)} ofertas")
-            return offers
+            browser = await p.chromium.launch_persistent_context(
+                user_data_dir, 
+                headless=headless_mode,
+                slow_mo=1000 if is_first_run else 0
+            )
+            
+            try:
+                if is_first_run:
+                    page = await browser.new_page()
+                    await page.goto("https://www.mercadolivre.com.br/afiliados/linkbuilder#hub")
+                    print("Faça login manualmente e feche o navegador")
+                    await page.wait_for_timeout(300000)
+                    await browser.close()
+                    print("Login concluído. Execute novamente.")
+                    return []
+                
+                print("Acessando o site Pelando...")
+                page = await browser.new_page()
+                await page.goto(self.base_url, wait_until="networkidle")
+                await page.wait_for_selector("._deal-card_1jdb6_25", timeout=20000)
+                offers = await self._extract_offers(page, max_offers, browser)
+                print(f"Encontradas {len(offers)} ofertas")
+                return offers
 
-        except Exception as e:
-            print(f"Erro ao acessar Pelando: {e}")
-            return []
+            except Exception as e:
+                print(f"Erro ao fazer scraping: {e}")
+                return []
+            finally:
+                await browser.close()
 
-    def generate_affiliate_link(self, title, store):
-        """Gera link de afiliado buscando no Google"""
-        if not title or not store:
-            return ""
+    async def _extract_offers(self, page, max_offers, browser):
+        """Extrai informações das ofertas da página"""
+        offers = []
+        deal_cards = await page.query_selector_all("._deal-card_1jdb6_25")
         
+        for i, card in enumerate(deal_cards[:max_offers]):
+            try:
+                # Extrair título básico
+                title_element = await card.query_selector("._title_mszsg_31")
+                title = await title_element.inner_text() if title_element else ""
+                
+                # Ignorar cupons
+                if "cupom" in title.lower():
+                    print(f"\n⚠️ Oferta de cupom ignorada: '{title}'")
+                    continue
+                    
+                offer = await self._extract_offer_data(card, browser)
+                if offer:
+                    offers.append(offer)
+            except Exception as e:
+                print(f"Erro ao extrair oferta {i}: {e}")
+                continue
+                
+        return offers
+
+    async def _extract_offer_data(self, card, browser):
+        """Extrai dados de uma oferta específica"""
         try:
-            # Criar query de busca
-            search_query = f"{title} {store}"
-            print(f"\n🔍 Buscando: '{search_query}'")
+            # Extração básica de dados
+            title_element = await card.query_selector("._title_mszsg_31")
+            title = await title_element.inner_text() if title_element else ""
+            clean_title = self._clean_title(title)
+
+            link_element = await card.query_selector("._title_mszsg_31")
+            original_link = await link_element.get_attribute("href") if link_element else ""
+            if original_link and not original_link.startswith("http"):
+                original_link = f"https://www.pelando.com.br{original_link}"
+
+            # Gerar link de afiliado
+            store_element = await card.query_selector("._container_13qz9_31 a")
+            store = await store_element.inner_text() if store_element else ""
+            affiliate_link = await self._generate_affiliate_link(
+                original_link, 
+                store, 
+                clean_title,
+                browser
+            )
+
+            # Extrair outros dados
+            price_element = await card.query_selector("._deal-card-stamp_15l5n_25")
+            price = await price_element.inner_text() if price_element else "Preço não informado"
             
-            # Buscar no Google
-            google_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(search_query)}"
-            headers = self.get_random_headers()
-            response = requests.get(google_url, headers=headers)
-            response.raise_for_status()
+            temp_element = await card.query_selector("._deal-card-temperature_1o9of_29 span")
+            temperature = await temp_element.inner_text() if temp_element else "0°"
             
-            # Parsear resultados
-            soup = BeautifulSoup(response.text, 'html.parser')
-            links = soup.select('a')
+            time_element = await card.query_selector("._timestamp_1s0as_25")
+            timestamp = await time_element.inner_text() if time_element else "Tempo não informado"
             
-            # Procurar link relevante
-            for link in links:
-                href = link.get('href')
-                if href and href.startswith('/url?q='):
-                    # Extrair URL real
-                    clean_url = re.search(r'/url\?q=([^&]+)', href)
-                    if clean_url:
-                        product_url = urllib.parse.unquote(clean_url.group(1))
-                        
-                        # Verificar se é URL de produto
-                        if self.is_product_url(product_url, store):
-                            # Adicionar parâmetro de afiliado
-                            return self.add_affiliate_param(product_url, store)
+            img_element = await card.query_selector("._deal-card-image_1glvo_31")
+            image_url = await img_element.get_attribute("src") if img_element else ""
+
+            return {
+                'title': title.strip(),
+                'price': price.strip(),
+                'store': store.strip(),
+                'temperature': temperature.strip(),
+                'timestamp': timestamp.strip(),
+                'link': affiliate_link,
+                'original_link': original_link,
+                'image_url': image_url,
+                'scraped_at': datetime.now().isoformat()
+            }
+
+        except Exception as e:
+            print(f"Erro ao extrair dados: {e}")
+            return None
+
+    def _clean_title(self, title):
+        """Remove caracteres especiais e palavras irrelevantes"""
+        clean_title = re.sub(r'[^\w\s]', ' ', title)
+        stopwords = ['OFF', 'Desconto', 'Promoção', 'Oferta', 'cupom', 'R\$', 'reais']
+        words = [word for word in clean_title.split() 
+                 if word.lower() not in stopwords and len(word) > 2]
+        return ' '.join(words[:10])
+
+    async def _generate_affiliate_link(self, original_url, store_name, title, browser):
+        """Gera link de afiliado com base na loja"""
+        store_name_lower = (store_name or "").lower()
+        
+        if "mercado livre" in store_name_lower or "mercadolivre" in store_name_lower:
+            return await self._generate_mercado_livre_affiliate_link(title, browser)
+        return original_url
+
+    async def _generate_mercado_livre_affiliate_link(self, title, browser):
+        """Solução unificada para produtos com API + Google"""
+        try:
+            # Tentativa 1: API Mercado Livre
+            api_url = f"https://api.mercadolibre.com/sites/MLB/search?q={urllib.parse.quote(title)}&limit=1"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('results') and len(data['results']) > 0:
+                            product_url = data['results'][0]['permalink']
+                            print(f"✅ Link via API: {product_url[:60]}...")
+                            return self._add_affiliate_param(product_url)
             
-            print("⚠️ Nenhum link de produto encontrado")
+            # Tentativa 2: Busca no Google
+            print(f"🔍 Buscando no Google: '{title}'")
+            page = await browser.new_page()
+            try:
+                search_query = urllib.parse.quote(f"{title} site:mercadolivre.com.br")
+                await page.goto(f"https://www.google.com/search?q={search_query}", 
+                               wait_until="networkidle", 
+                               timeout=30000)
+                
+                # Localizar todos os links do Mercado Livre
+                results = await page.query_selector_all('a[href*="mercadolivre.com.br"]')
+                for link in results:
+                    href = await link.get_attribute('href')
+                    if href and ('/p/' in href or 'MLB-' in href):
+                        # Limpar URL do Google
+                        match = re.search(r'url\?q=([^&]+)', href)
+                        if match:
+                            clean_url = urllib.parse.unquote(match.group(1))
+                            print(f"✅ Link via Google: {clean_url[:60]}...")
+                            return self._add_affiliate_param(clean_url)
+            finally:
+                await page.close()
+            
+            print("⚠️ Nenhum link encontrado")
             return ""
             
         except Exception as e:
-            print(f"❌ Erro na busca do Google: {e}")
+            print(f"❌ Erro na busca: {str(e)}")
             return ""
 
-    def is_product_url(self, url, store):
-        """Verifica se a URL é de um produto válido"""
-        store_lower = store.lower()
-        
-        if "amazon" in store_lower:
-            return "amazon." in url and "/dp/" in url
-        elif "mercado livre" in store_lower or "mercadolivre" in store_lower:
-            return "mercadolivre." in url and ("/p/" in url or "MLB-" in url)
-        elif "aliexpress" in store_lower:
-            return "aliexpress." in url and "/item/" in url
-        
-        return True  # Para outras lojas, aceita qualquer URL
-
-    def add_affiliate_param(self, url, store):
-        """Adiciona parâmetro de afiliado à URL"""
-        store_lower = store.lower()
-        
-        # Determinar parâmetro correto para cada loja
-        if "amazon" in store_lower:
-            param = "tag"
-            affiliate_id = self.affiliate_ids.get("amazon", "")
-        elif "mercado livre" in store_lower or "mercadolivre" in store_lower:
-            param = "afiliado"
-            affiliate_id = self.affiliate_ids.get("mercado livre", "")
-        elif "aliexpress" in store_lower:
-            # AliExpress usa URL especial
-            return f"https://s.click.aliexpress.com/e/{self.affiliate_ids.get('aliexpress', '')}?product_url={urllib.parse.quote(url)}"
-        else:
-            return url  # Sem afiliado para outras lojas
-        
-        if not affiliate_id:
+    def _add_affiliate_param(self, url):
+        """Adiciona parâmetro de afiliado mantendo query existente"""
+        if not self.affiliate_id_mercadolivre or not url:
             return url
-        
-        # Adicionar parâmetro à query string
+            
         parsed = urllib.parse.urlparse(url)
         query = urllib.parse.parse_qs(parsed.query)
-        query[param] = [affiliate_id]
+        query['afiliado'] = [self.affiliate_id_mercadolivre]
         new_query = urllib.parse.urlencode(query, doseq=True)
         
         return urllib.parse.urlunparse((
@@ -192,18 +210,18 @@ class PelandoScraper:
             parsed.fragment
         ))
 
-def main():
+async def main():
     scraper = PelandoScraper()
-    offers = scraper.scrape_offers(max_offers=5)
+    offers = await scraper.scrape_offers(max_offers=5)
 
     print("\n=== RESULTADOS ===")
     for i, offer in enumerate(offers, 1):
         print(f"\n{i}. {offer['title']}")
-        print(f"   Loja: {offer['store']}")
         print(f"   Preço: {offer['price']}")
+        print(f"   Loja: {offer['store']}")
         print(f"   Temperatura: {offer['temperature']}")
         print(f"   Link Original: {offer['original_link']}")
         print(f"   Link Afiliado: {offer['link'][:70]}{'...' if len(offer['link']) > 70 else ''}")
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
